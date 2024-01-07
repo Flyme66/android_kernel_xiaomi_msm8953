@@ -13,6 +13,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
+
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -31,20 +32,39 @@
 #include <linux/uaccess.h>
 #include <net/netlink.h>
 #include <net/sock.h>
+
 #define GF_IOC_MAGIC 'g'
 #define GF_IOC_INIT _IOR(GF_IOC_MAGIC, 0, uint8_t)
 #define GF_IOC_RESET _IO(GF_IOC_MAGIC, 2)
 #define GF_IOC_ENABLE_IRQ _IO(GF_IOC_MAGIC, 3)
 #define GF_IOC_DISABLE_IRQ _IO(GF_IOC_MAGIC, 4)
+
 #define GF_SPIDEV_NAME "goodix,fingerprint"
 #define GF_DEV_NAME "goodix_fp"
 #define GF_INPUT_NAME "gf3208"
 #define CHRD_DRIVER_NAME "goodix_fp_spi"
 #define CLASS_NAME "goodix_fp"
 #define N_SPI_MINORS 256
+
 #define GF_NET_EVENT_IRQ 1
 #define NETLINK_TEST 25
 #define MAX_MSGSIZE 16
+
+#if (defined CONFIG_MACH_XIAOMI_SAKURA) || (defined CONFIG_MACH_XIAOMI_DAISY)
+// Qcom values
+#define GF_NAV_INPUT_UP			KEY_UP
+#define GF_NAV_INPUT_DOWN		KEY_DOWN
+#define GF_NAV_INPUT_LEFT		KEY_LEFT
+#define GF_NAV_INPUT_RIGHT		KEY_RIGHT
+#else
+// Xiaomi values
+#define GF_NAV_INPUT_UP			195
+#define GF_NAV_INPUT_DOWN		196
+#define GF_NAV_INPUT_LEFT		197
+#define GF_NAV_INPUT_RIGHT		198
+#endif
+
+#define GF_IOC_NAV_EVENT	_IOW(GF_IOC_MAGIC, 14, gf_nav_event_t)
 
 struct gf_dev {
 	dev_t devt;
@@ -58,13 +78,37 @@ struct gf_dev {
 	int irq_enabled;
 };
 
+typedef enum gf_nav_event {
+	GF_NAV_NONE = 0,
+	GF_NAV_FINGER_UP,
+	GF_NAV_FINGER_DOWN,
+	GF_NAV_UP,
+	GF_NAV_DOWN,
+	GF_NAV_LEFT,
+	GF_NAV_RIGHT,
+} gf_nav_event_t;
+
+struct gf_key_map {
+	unsigned int type;
+	unsigned int code;
+};
+
+static struct gf_key_map maps[] = {
+	{ EV_KEY, GF_NAV_INPUT_UP },
+	{ EV_KEY, GF_NAV_INPUT_DOWN },
+	{ EV_KEY, GF_NAV_INPUT_LEFT },
+	{ EV_KEY, GF_NAV_INPUT_RIGHT },
+};
+
 static int SPIDEV_MAJOR;
 static DECLARE_BITMAP(minors, N_SPI_MINORS);
 static LIST_HEAD(device_list);
 static struct gf_dev gf;
 static struct wakeup_source fp_wakelock;
+
 static int pid = -1;
 static struct sock *nl_sk = NULL;
+
 static inline void sendnlmsg(char *message) {
 	struct sk_buff *skb_1;
 	struct nlmsghdr *nlh;
@@ -83,6 +127,7 @@ static inline void sendnlmsg(char *message) {
 	memcpy(NLMSG_DATA(nlh), message, slen + 1);
 	netlink_unicast(nl_sk, skb_1, pid, MSG_DONTWAIT);
 }
+
 static inline void nl_data_ready(struct sk_buff *__skb) {
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
@@ -95,6 +140,7 @@ static inline void nl_data_ready(struct sk_buff *__skb) {
 		kfree_skb(skb);
 	}
 }
+
 static inline void netlink_init(void) {
 	struct netlink_kernel_cfg netlink_cfg;
 	netlink_cfg.groups = 0;
@@ -103,12 +149,14 @@ static inline void netlink_init(void) {
 	netlink_cfg.cb_mutex = NULL;
 	nl_sk = netlink_kernel_create(&init_net, NETLINK_TEST, &netlink_cfg);
 }
+
 static inline void netlink_exit(void) {
 	if (!nl_sk)
 		return;
 	netlink_kernel_release(nl_sk);
 	nl_sk = NULL;
 }
+
 static inline int gf_parse_dts(struct gf_dev *gf_dev) {
 	struct device *dev = &gf_dev->spi->dev;
 	gf_dev->reset_gpio =
@@ -121,6 +169,7 @@ static inline int gf_parse_dts(struct gf_dev *gf_dev) {
 	gpio_direction_input(gf_dev->irq_gpio);
 	return 0;
 }
+
 static inline void gf_cleanup(struct gf_dev *gf_dev) {
 	struct device *dev = &gf_dev->spi->dev;
 	if (gpio_is_valid(gf_dev->irq_gpio))
@@ -128,6 +177,7 @@ static inline void gf_cleanup(struct gf_dev *gf_dev) {
 	if (gpio_is_valid(gf_dev->reset_gpio))
 		devm_gpio_free(dev, gf_dev->reset_gpio);
 }
+
 static inline irqreturn_t gf_irq(int irq, void *handle) {
 	char msg[2] = {0x0};
 	msg[0] = GF_NET_EVENT_IRQ;
@@ -135,6 +185,7 @@ static inline irqreturn_t gf_irq(int irq, void *handle) {
 	sendnlmsg(msg);
 	return IRQ_HANDLED;
 }
+
 static inline int irq_setup(struct gf_dev *gf_dev) {
 	struct device *dev = &gf_dev->spi->dev;
 	int status;
@@ -149,6 +200,7 @@ static inline int irq_setup(struct gf_dev *gf_dev) {
 	gf_dev->irq_enabled = 1;
 	return status;
 }
+
 static inline void irq_cleanup(struct gf_dev *gf_dev) {
 	struct device *dev = &gf_dev->spi->dev;
 	if (gf_dev->irq_enabled)
@@ -158,10 +210,44 @@ static inline void irq_cleanup(struct gf_dev *gf_dev) {
 	gf_dev->irq_enabled = 0;
 }
 
+static void nav_event_input(struct gf_dev *gf_dev, gf_nav_event_t nav_event) {
+	uint32_t nav_input = 0;
+
+	switch (nav_event) {
+
+	case GF_NAV_FINGER_DOWN:
+		break;
+	case GF_NAV_FINGER_UP:
+		break;
+	case GF_NAV_DOWN:
+		nav_input = GF_NAV_INPUT_DOWN;
+		break;
+	case GF_NAV_UP:
+		nav_input = GF_NAV_INPUT_UP;
+		break;
+	case GF_NAV_LEFT:
+		nav_input = GF_NAV_INPUT_LEFT;
+		break;
+	case GF_NAV_RIGHT:
+		nav_input = GF_NAV_INPUT_RIGHT;
+		break;
+	default:
+		break;
+	}
+
+	if ((nav_event != GF_NAV_FINGER_DOWN) && (nav_event != GF_NAV_FINGER_UP)) {
+		input_report_key(gf_dev->input, nav_input, 1);
+		input_sync(gf_dev->input);
+		input_report_key(gf_dev->input, nav_input, 0);
+		input_sync(gf_dev->input);
+	}
+}
+
 static inline long gf_ioctl(struct file *filp, unsigned int cmd,
 							unsigned long arg) {
 	struct gf_dev *gf_dev = &gf;
 	int retval = 0;
+	gf_nav_event_t nav_event = GF_NAV_NONE;
 	u8 netlink_route = NETLINK_TEST;
 	switch (cmd) {
 	case GF_IOC_INIT:
@@ -188,11 +274,20 @@ static inline long gf_ioctl(struct file *filp, unsigned int cmd,
 		gpio_set_value(gf_dev->reset_gpio, 1);
 		mdelay(3);
 		break;
+	case GF_IOC_NAV_EVENT:
+		if (copy_from_user(&nav_event, (void __user *)arg, sizeof(gf_nav_event_t))) {
+			retval = -EFAULT;
+			break;
+		}
+
+		nav_event_input(gf_dev, nav_event);
+		break;
 	default:
 		break;
 	}
 	return retval;
 }
+
 static inline int gf_open(struct inode *inode, struct file *filp) {
 	struct gf_dev *gf_dev = &gf;
 	int status = -ENXIO;
@@ -222,6 +317,7 @@ static inline int gf_open(struct inode *inode, struct file *filp) {
 	}
 	return status;
 }
+
 static inline int gf_release(struct inode *inode, struct file *filp) {
 	struct gf_dev *gf_dev = &gf;
 	int status = 0;
@@ -234,16 +330,19 @@ static inline int gf_release(struct inode *inode, struct file *filp) {
 	}
 	return status;
 }
+
 static const struct file_operations gf_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = gf_ioctl,
 	.open = gf_open,
 	.release = gf_release,
 };
+
 static struct class *gf_class;
 static inline int gf_probe(struct platform_device *pdev) {
 	struct gf_dev *gf_dev = &gf;
 	int status = -EINVAL;
+	int i;
 	unsigned long minor;
 	INIT_LIST_HEAD(&gf_dev->device_entry);
 	gf_dev->spi = pdev;
@@ -273,6 +372,8 @@ static inline int gf_probe(struct platform_device *pdev) {
 		if (gf_dev->input != NULL)
 			input_free_device(gf_dev->input);
 	}
+	for (i = 0; i < ARRAY_SIZE(maps); i++)
+		input_set_capability(gf_dev->input, maps[i].type, maps[i].code);
 	gf_dev->input->name = GF_INPUT_NAME;
 	status = input_register_device(gf_dev->input);
 	if (status) {
@@ -285,6 +386,7 @@ static inline int gf_probe(struct platform_device *pdev) {
 	wakeup_source_init(&fp_wakelock, "fp_wakelock");
 	return status;
 }
+
 static inline int gf_remove(struct platform_device *pdev) {
 	struct gf_dev *gf_dev = &gf;
 	if (gf_dev->input)
@@ -296,10 +398,12 @@ static inline int gf_remove(struct platform_device *pdev) {
 	wakeup_source_trash(&fp_wakelock);
 	return 0;
 }
+
 static const struct of_device_id gx_match_table[] = {
 	{.compatible = GF_SPIDEV_NAME},
 	{},
 };
+
 static struct platform_driver gf_driver = {
 	.driver =
 		{
@@ -310,6 +414,7 @@ static struct platform_driver gf_driver = {
 	.probe = gf_probe,
 	.remove = gf_remove,
 };
+
 static inline int __init gf_init(void) {
 	int status;
 	BUILD_BUG_ON(N_SPI_MINORS > 256);
@@ -331,6 +436,7 @@ static inline int __init gf_init(void) {
 	return 0;
 }
 module_init(gf_init);
+
 static inline void __exit gf_exit(void) {
 	netlink_exit();
 	platform_driver_unregister(&gf_driver);
@@ -338,6 +444,7 @@ static inline void __exit gf_exit(void) {
 	unregister_chrdev(SPIDEV_MAJOR, gf_driver.driver.name);
 }
 module_exit(gf_exit);
+
 MODULE_AUTHOR("Jiangtao Yi, <yijiangtao@goodix.com>");
 MODULE_AUTHOR("Jandy Gou, <gouqingsong@goodix.com>");
 MODULE_AUTHOR("Jebaitedneko, <jebaitedneko@gmail.com>");
